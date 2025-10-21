@@ -1,5 +1,5 @@
 #!/bin/bash
-ROOT_DIR="root to LLaVA-NeXT-Video"
+ROOT_DIR="/mnt/aix23103/LLaVA-NeXT"
 
 if [ ! -e $ROOT_DIR ]; then
     echo "The root dir does not exist. Exiting the script."

@@ -20,14 +20,18 @@ import re
 import time
 import torch
 import torch.nn as nn
-from .multimodal_encoder.builder import build_vision_tower
-from .multimodal_resampler.builder import build_vision_resampler
-from .multimodal_projector.builder import build_vision_projector
+import torch.nn.functional as F
+import numpy as np
+import os
+import functools
+from llava.model.multimodal_encoder.builder import build_vision_tower
+from llava.model.multimodal_resampler.builder import build_vision_resampler
+from llava.model.multimodal_projector.builder import build_vision_projector
+import subprocess
 
-from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from llava.mom.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from llava.mom.utils import rank0_print, rank_print
 
-from llava.mm_utils import get_anyres_image_grid_shape
-from llava.utils import rank0_print, rank_print
 import random
 
 
@@ -168,7 +172,12 @@ class LlavaMetaForCausalLM(ABC):
     def get_vision_tower(self):
         return self.get_model().get_vision_tower()
 
+    def get_motion_encoders(self):
+            model = self.get_model()
+            return model.mve, model.mfe, model.mvresidual, model.motion_proj
+
     def get_2dPool(self, image_feature, stride=2):
+        # print("Pooling mode:", self.config.mm_spatial_pool_mode)
         height = width = self.get_vision_tower().num_patches_per_side
         num_frames, num_tokens, num_dim = image_feature.shape
         image_feature = image_feature.view(num_frames, height, width, -1)
@@ -192,6 +201,7 @@ class LlavaMetaForCausalLM(ABC):
     def encode_images(self, images):
         image_features = self.get_model().get_vision_tower()(images)
         # image_features = self.get_model().vision_resampler(image_features, images=images)
+        image_features = image_features.to(self.get_model().mm_projector[0].weight.dtype)
         image_features = self.get_model().mm_projector(image_features)
         return image_features
     
@@ -224,9 +234,9 @@ class LlavaMetaForCausalLM(ABC):
         num_frames = image_feature.shape[0]
         feature_dim = image_feature.shape[-1]
 
-        image_feature = image_feature.view(num_frames, 1, resize_h, resize_h, -1)
-        image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
-        image_feature = image_feature.flatten(1, 2).flatten(2, 3)
+        image_feature = image_feature.view(num_frames, 1, resize_h, resize_h, -1) # (F, 1, h, w, D)
+        image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous() # (D, F, h, 1, w)
+        image_feature = image_feature.flatten(1, 2).flatten(2, 3) # (D, F*h, w)
         image_feature = torch.cat((image_feature, self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)
         if getattr(self.config, "add_faster_video", False):
             # import pdb; pdb.set_trace()
@@ -239,7 +249,7 @@ class LlavaMetaForCausalLM(ABC):
             # import pdb; pdb.set_trace()
             return image_feature
         # import pdb; pdb.set_trace()
-        image_feature = image_feature.flatten(1, 2).transpose(0, 1)
+        image_feature = image_feature.flatten(1, 2).transpose(0, 1) # (F*(h+1), w, D)
         return image_feature
 
     def add_token_per_frame(self, image_feature):
@@ -250,6 +260,31 @@ class LlavaMetaForCausalLM(ABC):
 
     def prepare_inputs_labels_for_multimodal(self, input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities=["image"], image_sizes=None):
         vision_tower = self.get_vision_tower()
+        
+        mve, mfe, mvresidual, motion_proj = self.get_motion_encoders()
+        frames, motions_norm, motion_indices, motions_raw = mve(images)   # 프레임, 모션, 인덱스 추출
+        images, motion_feats, residual_feats = mfe(frames, motions_norm, motion_indices, motions_raw)
+        motion_features = mvresidual(motion_feats, residual_feats)
+        motion_features = motion_proj(motion_features)
+        N, T, H = motion_features.shape
+        # print("motion feature shape:", N, T, H)
+        
+        newline = self.motion_newline.to(device=motion_features.device, dtype=motion_features.dtype)[None, None, :]
+        newline = newline.expand(N, 1, H)  # (B, 1, H)
+        motion_with_frame_sep = []
+        for t in range(T):
+            motion_with_frame_sep.append(motion_features[:, t:t+1, :])  # (B, 1, H)
+            motion_with_frame_sep.append(newline)     # (B, 1, H)
+
+        motion_with_frame_sep = torch.cat(motion_with_frame_sep, dim=1)  # (B, T*2, H)
+        
+        # --- 모션 시작/끝 토큰 삽입 ---
+        motion_start = self.motion_start.to(device=motion_features.device, dtype=motion_features.dtype)[None, None, :].expand(N, 1, H)
+        motion_end = self.motion_end.to(device=motion_features.device, dtype=motion_features.dtype)[None, None, :].expand(N, 1, H)
+        motion_features = torch.cat([motion_start, motion_with_frame_sep, motion_end], dim=1)      
+        motion_features = motion_features.reshape(1, -1, H)
+        images = [images]
+        
         # rank_print(modalities)
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             return input_ids, position_ids, attention_mask, past_key_values, None, labels
@@ -280,10 +315,12 @@ class LlavaMetaForCausalLM(ABC):
             # image_features,all_faster_video_features = self.encode_multimodals(concat_images, video_idx_in_batch, split_sizes)
 
             # This is a list, each element is [num_images, patch * patch, dim]
-            # rank_print(f"Concat images : {concat_images.shape}")
+            rank_print(f"Concat images : {concat_images.shape}")
+            rank_print("encoded_image_features shape:", encoded_image_features.shape)
             encoded_image_features = torch.split(encoded_image_features, split_sizes)
             image_features = []
             for idx, image_feat in enumerate(encoded_image_features):
+                # print("image_feat shape:", image_feat.shape, idx)
                 if idx in video_idx_in_batch:
                     image_features.append(self.get_2dPool(image_feat))
                 else:
@@ -300,6 +337,7 @@ class LlavaMetaForCausalLM(ABC):
 
             elif mm_patch_merge_type.startswith("spatial"):
                 new_image_features = []
+                print(image_features[0].shape)
                 for image_idx, image_feature in enumerate(image_features):
                     # FIXME: now assume the image is square, and split to 2x2 patches
                     # num_patches = h * w, where h = w = sqrt(num_patches)
@@ -333,77 +371,9 @@ class LlavaMetaForCausalLM(ABC):
                             image_feature = self.add_token_per_frame(image_feature)
 
                             new_image_features.append(image_feature.flatten(0, 1))
-                            
-                        elif mm_newline_position == "one_token":
-                            # one-token
-                            image_feature = image_feature.flatten(0, 1)
-                            if 'unpad' in mm_patch_merge_type:
-                                image_feature = torch.cat((
-                                    image_feature,
-                                    self.model.image_newline[None].to(image_feature.device)
-                                ), dim=0)
-                            new_image_features.append(image_feature)      
-                        elif mm_newline_position == "no_token":
-                            new_image_features.append(image_feature.flatten(0, 1))
                         else:
                             raise ValueError(f"Unexpected mm_newline_position: {mm_newline_position}")
-                    elif image_feature.shape[0] > 1:  # multi patches and multi images operations
-                        # rank0_print("Single-images")
-                        base_image_feature = image_feature[0]
-                        image_feature = image_feature[1:]
-                        height = width = self.get_vision_tower().num_patches_per_side
-                        assert height * width == base_image_feature.shape[0]
-
-                        if "anyres_max" in image_aspect_ratio:
-                            matched_anyres_max_num_patches = re.match(r"anyres_max_(\d+)", image_aspect_ratio)
-                            if matched_anyres_max_num_patches:
-                                max_num_patches = int(matched_anyres_max_num_patches.group(1))
-
-                        if image_aspect_ratio == "anyres" or "anyres_max" in image_aspect_ratio:
-                            if hasattr(self.get_vision_tower(), "image_size"):
-                                vision_tower_image_size = self.get_vision_tower().image_size
-                            else:
-                                raise ValueError("vision_tower_image_size is not found in the vision tower.")
-                            try:
-                                num_patch_width, num_patch_height = get_anyres_image_grid_shape(image_sizes[image_idx], self.config.image_grid_pinpoints, vision_tower_image_size)
-                            except Exception as e:
-                                rank0_print(f"Error: {e}")
-                                num_patch_width, num_patch_height = 2, 2
-                            image_feature = image_feature.view(num_patch_height, num_patch_width, height, width, -1)
-                        else:
-                            image_feature = image_feature.view(2, 2, height, width, -1)
-
-                        if "maxpool2x2" in mm_patch_merge_type:
-                            image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
-                            image_feature = image_feature.flatten(1, 2).flatten(2, 3)
-                            image_feature = nn.functional.max_pool2d(image_feature, 2)
-                            image_feature = image_feature.flatten(1, 2).transpose(0, 1)
-                        elif "unpad" in mm_patch_merge_type and "anyres_max" in image_aspect_ratio and matched_anyres_max_num_patches:
-                            unit = image_feature.shape[2]
-                            image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
-                            image_feature = image_feature.flatten(1, 2).flatten(2, 3)
-                            image_feature = unpad_image(image_feature, image_sizes[image_idx])
-                            c, h, w = image_feature.shape
-                            times = math.sqrt(h * w / (max_num_patches * unit**2))
-                            if times > 1.1:
-                                image_feature = image_feature[None]
-                                image_feature = nn.functional.interpolate(image_feature, [int(h // times), int(w // times)], mode="bilinear")[0]
-                            image_feature = torch.cat((image_feature, self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)
-                            image_feature = image_feature.flatten(1, 2).transpose(0, 1)
-                        elif "unpad" in mm_patch_merge_type:
-                            image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
-                            image_feature = image_feature.flatten(1, 2).flatten(2, 3)
-                            image_feature = unpad_image(image_feature, image_sizes[image_idx])
-                            image_feature = torch.cat((image_feature, self.model.image_newline[:, None, None].expand(*image_feature.shape[:-1], 1).to(image_feature.device)), dim=-1)
-                            image_feature = image_feature.flatten(1, 2).transpose(0, 1)
-                        else:
-                            image_feature = image_feature.permute(0, 2, 1, 3, 4).contiguous()
-                            image_feature = image_feature.flatten(0, 3)
-                        if "nobase" in mm_patch_merge_type:
-                            pass
-                        else:
-                            image_feature = torch.cat((base_image_feature, image_feature), dim=0)
-                        new_image_features.append(image_feature)
+                    
                     else:  # single image operations
                         image_feature = image_feature[0]
                         if "unpad" in mm_patch_merge_type:
@@ -413,7 +383,7 @@ class LlavaMetaForCausalLM(ABC):
                 image_features = new_image_features
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
-        else:
+        else: # 이미지가 하나 일 때
             image_features = self.encode_images(images)
 
         # TODO: image start / end is not implemented here to support pretraining.
@@ -425,6 +395,7 @@ class LlavaMetaForCausalLM(ABC):
         # it is a headache to deal with None all the time.
         # But it is not ideal, and if you have a better idea,
         # please open an issue / submit a PR, thanks.
+        
         _labels = labels
         _position_ids = position_ids
         _attention_mask = attention_mask
@@ -438,7 +409,7 @@ class LlavaMetaForCausalLM(ABC):
             labels = torch.full_like(input_ids, IGNORE_INDEX)
 
         # remove the padding using attention_mask -- FIXME
-        _input_ids = input_ids
+        cur_input_ids = input_ids
         input_ids = [cur_input_ids[cur_attention_mask] for cur_input_ids, cur_attention_mask in zip(input_ids, attention_mask)]
         labels = [cur_labels[cur_attention_mask] for cur_labels, cur_attention_mask in zip(labels, attention_mask)]
 
@@ -477,13 +448,18 @@ class LlavaMetaForCausalLM(ABC):
                 if i < num_images:
                     try:
                         cur_image_features = image_features[cur_image_idx]
+                        cur_motion_features = motion_features[cur_image_idx]
                     except IndexError:
                         cur_image_features = image_features[cur_image_idx - 1]
+                        cur_motion_features = motion_features[cur_image_idx - 1]
                     cur_image_idx += 1
                     cur_new_input_embeds.append(cur_image_features)
+                    cur_new_input_embeds.append(cur_motion_features)
                     cur_new_labels.append(torch.full((cur_image_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
+                    cur_new_labels.append(torch.full((cur_motion_features.shape[0],), IGNORE_INDEX, device=cur_labels.device, dtype=cur_labels.dtype))
 
             cur_new_input_embeds = [x.to(self.device) for x in cur_new_input_embeds]
+            print([x.shape for x in cur_new_input_embeds])
 
             # import pdb; pdb.set_trace()
             cur_new_input_embeds = torch.cat(cur_new_input_embeds)
@@ -495,8 +471,10 @@ class LlavaMetaForCausalLM(ABC):
         # Truncate sequences to max length as image embeddings can make the sequence longer
         tokenizer_model_max_length = getattr(self.config, "tokenizer_model_max_length", None)
         # rank_print("Finishing Inserting")
+        # print(tokenizer_model_max_length)
 
         new_input_embeds = [x[:tokenizer_model_max_length] for x, modality in zip(new_input_embeds, modalities)]
+        # print("new_input_embeds shape:", [x.shape for x in new_input_embeds], "new input embeds len", len(new_input_embeds))
         new_labels = [x[:tokenizer_model_max_length] for x, modality in zip(new_labels, modalities)]
         # TODO: Hard code for control loss spike
         # if tokenizer_model_max_length is not None:
@@ -506,6 +484,7 @@ class LlavaMetaForCausalLM(ABC):
         # Combine them
         max_len = max(x.shape[0] for x in new_input_embeds)
         batch_size = len(new_input_embeds)
+        # print("Max len:", max_len, "Batch size:", batch_size)
 
         new_input_embeds_padded = []
         new_labels_padded = torch.full((batch_size, max_len), IGNORE_INDEX, dtype=new_labels[0].dtype, device=new_labels[0].device)
@@ -529,6 +508,8 @@ class LlavaMetaForCausalLM(ABC):
                     position_ids[i, :cur_len] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
 
         new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
+        # rank_print(f"Final input_embeds: {new_input_embeds.shape}, labels: {new_labels_padded.shape}, attention_mask: {attention_mask.shape}, position_ids: {position_ids.shape}")
+        # print(sum(attention_mask), position_ids[0])
         # rank0_print("tokenizer padding")
 
         if _labels is None:

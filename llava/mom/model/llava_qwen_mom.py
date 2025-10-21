@@ -1,4 +1,4 @@
-#    Copyright 2023 Haotian Liu
+#    Copyright 2024 Hao Zhang
 #
 #    Licensed under the Apache License, Version 2.0 (the "License");
 #    you may not use this file except in compliance with the License.
@@ -13,40 +13,49 @@
 #    limitations under the License.
 
 
-from typing import List, Optional, Tuple, Union
-
+from typing import List, Optional, Tuple, Union, Dict
 import torch
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
 
-from transformers import AutoConfig, AutoModelForCausalLM, MixtralConfig, MixtralModel, MixtralForCausalLM, GenerationConfig
+import transformers
+from transformers import AutoConfig, AutoModelForCausalLM
 
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.generation.utils import GenerateOutput
 
-from llava.model.llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
+from llava.mom.model.llava_arch_mom import LlavaMetaModel, LlavaMetaForCausalLM
+from transformers import Qwen2Config, Qwen2Model, Qwen2ForCausalLM
+from llava.mom.encoder import MVResidualModel
+from llava.mom.processor import MotionVectorExtractor, MotionFeatureExtractor
 
 
-class LlavaMixtralConfig(MixtralConfig):
-    model_type = "llava_mixtral"
+class LlavaQwenMomConfig(Qwen2Config):
+    model_type = "llava_qwen"
 
 
-class LlavaMixtralModel(LlavaMetaModel, MixtralModel):
-    config_class = LlavaMixtralConfig
+class LlavaQwenMomModel(LlavaMetaModel, Qwen2Model):
+    config_class = LlavaQwenMomConfig
 
-    def __init__(self, config: MixtralConfig):
-        super(LlavaMixtralModel, self).__init__(config)
-
-
-class LlavaMixtralForCausalLM(MixtralForCausalLM, LlavaMetaForCausalLM):
-    config_class = LlavaMixtralConfig
+    def __init__(self, config: Qwen2Config):
+        super(LlavaQwenMomModel, self).__init__(config)
+        
+        hidden_dim = config.hidden_size
+        self.motion_start = nn.Parameter(torch.zeros(hidden_dim, dtype=torch.float32))
+        self.motion_end = nn.Parameter(torch.zeros(hidden_dim, dtype=torch.float32))
+        self.motion_newline = nn.Parameter(torch.zeros(hidden_dim, dtype=torch.float32))
+        self.mvresidual = MVResidualModel()
+        
+class LlavaQwenMomForCausalLM(Qwen2ForCausalLM, LlavaMetaForCausalLM):
+    config_class = LlavaQwenMomConfig
 
     def __init__(self, config):
-        super(MixtralForCausalLM, self).__init__(config)
-
-        config.model_type = "llava_mixtral"
+        # super(Qwen2ForCausalLM, self).__init__(config)
+        Qwen2ForCausalLM.__init__(self, config)
+        config.model_type = "llava_qwen"
         config.rope_scaling = None
-        self.model = LlavaMixtralModel(config)
+
+        self.model = LlavaQwenMomModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         # Initialize weights and apply final processing
         self.post_init()
@@ -66,15 +75,21 @@ class LlavaMixtralForCausalLM(MixtralForCausalLM, LlavaMetaForCausalLM):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         images: Optional[torch.FloatTensor] = None,
+        motion_feats: Optional[torch.FloatTensor] = None,
+        residual_feats: Optional[torch.FloatTensor] = None,
         image_sizes: Optional[List[List[int]]] = None,
         return_dict: Optional[bool] = None,
         modalities: Optional[List[str]] = ["image"],
-        dpo_forward: Optional[bool] = None,
+        dpo_forward: Optional[bool] = False,
         cache_position=None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
-        if inputs_embeds is None:
-            (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, modalities, image_sizes)
+        if images is not None:
+            (input_ids, position_ids, attention_mask, past_key_values, inputs_embeds, labels) = self.prepare_inputs_labels_for_multimodal(input_ids, position_ids, attention_mask, past_key_values, labels, images, motion_feats, residual_feats, modalities, image_sizes)
+            if inputs_embeds is not None:
+                inputs_embeds = inputs_embeds
+            else:
+                inputs_embeds = self.get_model().embed_tokens(input_ids)
 
         if dpo_forward:
             outputs = self.model(
@@ -112,8 +127,11 @@ class LlavaMixtralForCausalLM(MixtralForCausalLM, LlavaMetaForCausalLM):
         self,
         inputs: Optional[torch.Tensor] = None,
         images: Optional[torch.Tensor] = None,
+        motion_feats: Optional[torch.FloatTensor] = None,
+        residual_feats: Optional[torch.FloatTensor] = None,
         image_sizes: Optional[torch.Tensor] = None,
         modalities: Optional[List[str]] = ["image"],
+        inputs_embeds : Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
         position_ids = kwargs.pop("position_ids", None)
@@ -122,7 +140,7 @@ class LlavaMixtralForCausalLM(MixtralForCausalLM, LlavaMetaForCausalLM):
             raise NotImplementedError("`inputs_embeds` is not supported")
 
         if images is not None:
-            (inputs, position_ids, attention_mask, _, inputs_embeds, _) = self.prepare_inputs_labels_for_multimodal(inputs, position_ids, attention_mask, None, None, images, modalities, image_sizes=image_sizes)
+            (inputs, position_ids, attention_mask, _, inputs_embeds, _) = self.prepare_inputs_labels_for_multimodal(inputs, position_ids, attention_mask, None, None, images, motion_feats, residual_feats, modalities, image_sizes=image_sizes)
         else:
             inputs_embeds = self.get_model().embed_tokens(inputs)
 
@@ -131,6 +149,7 @@ class LlavaMixtralForCausalLM(MixtralForCausalLM, LlavaMetaForCausalLM):
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, inputs_embeds=None, **kwargs):
         images = kwargs.pop("images", None)
         image_sizes = kwargs.pop("image_sizes", None)
+        # print(inputs_embeds.shape)
         inputs = super().prepare_inputs_for_generation(input_ids, past_key_values=past_key_values, inputs_embeds=inputs_embeds, **kwargs)
         if images is not None:
             inputs["images"] = images
@@ -139,5 +158,5 @@ class LlavaMixtralForCausalLM(MixtralForCausalLM, LlavaMetaForCausalLM):
         return inputs
 
 
-AutoConfig.register("llava_mixtral", LlavaMixtralConfig)
-AutoModelForCausalLM.register(LlavaMixtralConfig, LlavaMixtralForCausalLM)
+AutoConfig.register("llava_qwen", LlavaQwenMomConfig)
+AutoModelForCausalLM.register(LlavaQwenMomConfig, LlavaQwenMomForCausalLM)
